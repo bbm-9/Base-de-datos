@@ -1566,16 +1566,19 @@ function procesarSeleccion(cursosArr, temasActivos){
     if(!pool.length) continue;
     const n=cfg.nPregs||10;
 
-    // Priorizar las menos usadas (suma de usos en cursos seleccionados)
-    pool=pool.slice().sort((a,b)=>{
-      const ua=cursosArr.reduce((s,k)=>s+(a[k]||0),0);
-      const ub=cursosArr.reduce((s,k)=>s+(b[k]||0),0);
-      return ua-ub;
-    });
+    // Priorizar las menos usadas. Los contadores de cada curso son
+    // independientes (usos_mod1/mod2/mod3/int): una pregunta solo cuenta
+    // como "nivel 0" si tiene 0 usos en TODOS los cursos de esta selección.
+    // Si tiene algún uso en cualquiera de ellos, su nivel es el mayor de
+    // esos usos (no la suma, que mezclaría contadores de cursos distintos
+    // y podría priorizar una pregunta ya usada en un curso frente a otra
+    // con 0 usos en ese mismo curso).
+    const nivelUso = q => Math.max(...cursosArr.map(k=>q[k]||0));
+    pool=pool.slice().sort((a,b)=>nivelUso(a)-nivelUso(b));
     // Barajar dentro del mismo nivel de uso
     const tiers={};
     pool.forEach(q=>{
-      const k=cursosArr.reduce((s,c)=>s+(q[c]||0),0);
+      const k=nivelUso(q);
       (tiers[k]||(tiers[k]=[])).push(q);
     });
     let prio=[];
