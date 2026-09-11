@@ -1848,14 +1848,45 @@ function actualizarUsosenSheets(preguntas, cursosArr){
     if(!r) return null;
     return { id:r.id, usos_mod1:r.usos_mod1, usos_mod2:r.usos_mod2, usos_mod3:r.usos_mod3, usos_int:r.usos_int };
   }).filter(Boolean);
+  if(!updates.length) return;
 
-  // Apps Script solo acepta CORS en GET → enviamos via GET con datos en URL
-  const encoded = encodeURIComponent(JSON.stringify(updates));
-  fetch(`https://script.google.com/macros/s/AKfycbz8A8boQzNJDScZEb0-LN-5FofUZ4Zkb6ObjroLlz7-GoCE3HLEHFsRzkZWNVJAJOzo/exec?action=updateUsos&updates=${encoded}`)
-    .then(r=>r.json())
-    .then(data=>{
-      if(data.ok) mostrarToast(`✅ ${data.updated} preguntas actualizadas en Google Sheets`);
-      else mostrarToast('⚠ Error Sheets: '+(data.error||''), true);
+  // Igual que al guardar el examen (enviarFilasExamenEnLotes): una tanda grande
+  // (p. ej. un simulacro de 100 preguntas) puede generar una URL de decenas de
+  // miles de caracteres si se manda de una vez, y muchos servidores/proxies la
+  // rechazan en silencio. Sin este batching, esos usos NUNCA llegan a
+  // persistirse en Sheets aunque sí queden incrementados en memoria local: la
+  // siguiente vez que se cargue la base de datos, esas preguntas vuelven a
+  // aparecer con usos anteriores a los reales y compiten de nuevo por
+  // prioridad. Se agrupan en lotes que quepan con margen en una URL y se
+  // envían uno tras otro (nunca en paralelo) contra la MISMA acción
+  // "updateUsos" del Apps Script, sin tocarlo.
+  const LIMITE_URL=6000;
+  const lotes=[];
+  let actual=[], tam=2; // "[]"
+  updates.forEach(u=>{
+    const tamItem=encodeURIComponent(JSON.stringify(u)).length+3;
+    if(actual.length && tam+tamItem>LIMITE_URL){ lotes.push(actual); actual=[]; tam=2; }
+    actual.push(u); tam+=tamItem;
+  });
+  if(actual.length) lotes.push(actual);
+
+  let totalActualizadas=0, huboError=false;
+  let cadena=Promise.resolve();
+  lotes.forEach(lote=>{
+    cadena=cadena.then(()=>{
+      const encoded=encodeURIComponent(JSON.stringify(lote));
+      return fetch(`https://script.google.com/macros/s/AKfycbz8A8boQzNJDScZEb0-LN-5FofUZ4Zkb6ObjroLlz7-GoCE3HLEHFsRzkZWNVJAJOzo/exec?action=updateUsos&updates=${encoded}`)
+        .then(r=>r.json())
+        .then(data=>{
+          if(data.ok) totalActualizadas+=data.updated||lote.length;
+          else huboError=true;
+        });
+    });
+  });
+  cadena
+    .then(()=>{
+      if(huboError) mostrarToast('⚠ Error Sheets al actualizar usos', true);
+      else mostrarToast(`✅ ${totalActualizadas} preguntas actualizadas en Google Sheets`);
     })
     .catch(()=>mostrarToast('⚠ Sin conexión, cambios solo en local', true));
 }
