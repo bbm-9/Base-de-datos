@@ -1693,12 +1693,27 @@ async function genExamFromPrep(){
   try{
     examenId = await persistirExamenEnSheets(rows, updates);
   }catch(err){
+    generandoExamen = false;
+    actualizarEstadoGenerando(false);
+
+    if(err.indeterminado){
+      // No sabemos si el backend llegó a escribir (p.ej. respondió HTML, o
+      // una forma de JSON que no es el {ok:false,...} que garantiza
+      // generarExamen): NUNCA se asume fallo, NUNCA se reintenta solo, y NO
+      // se deshacen los incrementos locales -- podrían ya estar reflejados
+      // en Sheets, y revertirlos violaría la prioridad por usos en el
+      // próximo examen si el guardado sí tuvo éxito.
+      document.getElementById('genMsgFinal').innerHTML=`<span style="color:#c8952b;font-size:.8rem;">⚠️ No se pudo confirmar la respuesta del servidor. El examen puede haberse generado. Actualiza el Historial antes de volver a intentarlo.<br><small style="color:var(--txt3);">${esc(err.message)}</small></span>`;
+      return;
+    }
+
+    // Fallo CONFIRMADO por el propio backend (ok:false explícito): el
+    // contrato de generarExamen garantiza que en ese caso no se ha escrito
+    // nada, así que es seguro deshacer los incrementos locales y reintentar.
     incrementosAplicados.forEach(({_idx, cursosArr})=>{
       const r=db.find(r=>r._idx===_idx);
       if(r) cursosArr.forEach(k=>{ r[k]=Math.max(0,(r[k]||0)-1); });
     });
-    generandoExamen = false;
-    actualizarEstadoGenerando(false);
     document.getElementById('genMsgFinal').innerHTML=`<span style="color:#e05555;font-size:.8rem;">❌ No se pudo generar el examen (${esc(err.message)}). La configuración se ha conservado: puedes pulsar "Generar Examen" de nuevo para reintentarlo.</span>`;
     return;
   }
@@ -1952,24 +1967,94 @@ function construirFilasExamen(preguntas, nombreExamen){
   return rows;
 }
 
+// ══ Llamadas a Apps Script: helper común y robusto ══
+// Apps Script puede, en circunstancias excepcionales (redirecciones internas
+// script.google.com -> script.googleusercontent.com, ejecuciones lentas bajo
+// LockService, páginas de autorización), devolver algo que NO es el JSON que
+// nuestra acción produjo -- incluyendo HTML. Este helper:
+//   1) lee response.text() UNA sola vez;
+//   2) nunca llama a response.json() directamente;
+//   3) detecta HTML explícitamente antes de intentar parsear;
+//   4) solo entonces hace JSON.parse, con un mensaje de diagnóstico útil si
+//      falla (en vez de un críptico "Unexpected token '<'").
+// Devuelve { data, response, raw }. NO decide por sí mismo si `data` es un
+// éxito o un fallo de la acción: cada llamador conoce el contrato exacto de
+// su propia acción y es quien debe decidirlo (ver persistirExamenEnSheets).
+// Los errores de transporte (red, HTML, JSON inválido) se lanzan con
+// `.indeterminado = true`: no sabemos si el backend llegó a ejecutar nada.
+function crearErrorAppsScript(mensaje, extra){
+  const e = new Error(mensaje);
+  e.indeterminado = true;
+  if(extra) Object.assign(e, extra);
+  return e;
+}
+
+async function llamarAppsScript(url, options){
+  let response;
+  try{
+    response = await fetch(url, options);
+  }catch(err){
+    throw crearErrorAppsScript('No se pudo contactar con el servidor: ' + err.message);
+  }
+
+  const raw = await response.text();
+  const contentType = response.headers.get('content-type') || '';
+  const pareceHtml = /^\s*<(!doctype|html)/i.test(raw) || contentType.toLowerCase().includes('text/html');
+
+  if(pareceHtml){
+    throw crearErrorAppsScript(
+      `Apps Script devolvió HTML en lugar de JSON. HTTP ${response.status} / URL final: ${response.url}${response.redirected ? ' (hubo redirección)' : ''}`,
+      { raw, status:response.status, url:response.url, redirected:response.redirected }
+    );
+  }
+
+  let data;
+  try{
+    data = JSON.parse(raw);
+  }catch(err){
+    throw crearErrorAppsScript(
+      `Respuesta del servidor no es JSON válido. HTTP ${response.status} / URL final: ${response.url}`,
+      { raw, status:response.status, url:response.url, redirected:response.redirected }
+    );
+  }
+
+  return { data, response, raw };
+}
+
 // Persiste el examen completo en UNA única petición POST: el Apps Script
 // calcula el examen_id (max existente + 1, bajo LockService), actualiza los
 // usos de BD en bloque y guarda las filas de EXAMENES, todo en la misma
-// operación atómica. Devuelve el examen_id asignado; rechaza si algo falla
-// (sin ID local de emergencia: si esto falla, no hay examen que mostrar).
+// operación atómica. Devuelve el examen_id asignado.
+//
+// Clasificación de errores, crítica para no duplicar exámenes:
+//   - data.ok === false  -> FALLO CONFIRMADO. El contrato de generarExamen
+//     garantiza que si devuelve ok:false no ha escrito nada (LockService
+//     envuelve id + usos + EXAMENES en una sola operación). Es seguro
+//     deshacer los incrementos locales y ofrecer reintentar.
+//   - cualquier otra cosa (HTML, JSON no parseable, red caída, o JSON bien
+//     formado pero sin ok:false explícito -- p.ej. una respuesta que no
+//     coincide con el contrato esperado de generarExamen) -> ESTADO
+//     INDETERMINADO. No sabemos si el backend ya escribió. NUNCA se trata
+//     como fallo confirmado ni se sugiere reintentar sin más.
 function persistirExamenEnSheets(rows, updates){
-  return fetch(API_URL, {
+  return llamarAppsScript(API_URL, {
     method: 'POST',
     // text/plain evita que el navegador dispare un preflight CORS OPTIONS,
     // que los Web Apps de Apps Script no responden.
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify({ action:'generarExamen', rows, updates })
-  })
-    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-    .then(data=>{
-      if(!data.ok) throw new Error(data.error || 'Error desconocido al generar el examen');
-      return data.examen_id;
-    });
+  }).then(({data})=>{
+    if(data.ok === true) return data.examen_id;
+    if(data.ok === false){
+      const e = new Error(data.error || 'Error desconocido al generar el examen');
+      e.indeterminado = false;
+      throw e;
+    }
+    // Respuesta bien formada como JSON pero que no cumple el contrato de
+    // generarExamen (por ejemplo, ausencia total de "ok"): no es el fallo
+    // confirmado que garantiza el backend, así que se trata como indeterminado.
+    throw crearErrorAppsScript('Respuesta inesperada del servidor: ' + JSON.stringify(data).slice(0, 200));
+  });
 }
 
 // Reconstruye los exámenes a partir de las filas planas de la hoja EXAMENES:
@@ -2028,9 +2113,8 @@ function cargarHistorial(){
   const list = document.getElementById('historialList');
   msg.innerHTML = `<div class="alert a-info"><span class="spin"></span>&nbsp;Cargando historial…</div>`;
   list.innerHTML = '';
-  fetch(`https://script.google.com/macros/s/AKfycbz8A8boQzNJDScZEb0-LN-5FofUZ4Zkb6ObjroLlz7-GoCE3HLEHFsRzkZWNVJAJOzo/exec?action=getExamenes`)
-    .then(r=>r.json())
-    .then(data=>{
+  llamarAppsScript(`${API_URL}?action=getExamenes`)
+    .then(({data})=>{
       msg.innerHTML='';
       if(!data.ok){ msg.innerHTML=`<div class="alert a-err">❌ ${esc(data.error||'')}</div>`; return; }
       if(!data.rows.length){ msg.innerHTML=`<div class="alert a-info">ℹ No hay exámenes guardados aún.</div>`; return; }
