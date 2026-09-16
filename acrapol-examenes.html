@@ -496,7 +496,7 @@ tbody tr:last-child td{border-bottom:none;}
         <div class="cico">🧩</div>
         <h2>Examen en preparación</h2>
         <span style="margin-left:.5rem;font-size:.72rem;color:var(--txt3);">Temas acumulados antes de generar</span>
-        <button class="btn btn-ghost" style="margin-left:auto;font-size:.68rem;" onclick="vaciarExamenPrep()">🗑 Vaciar examen</button>
+        <button class="btn btn-ghost" id="btnVaciarPrep" style="margin-left:auto;font-size:.68rem;" onclick="vaciarExamenPrep()">🗑 Vaciar examen</button>
       </div>
       <div class="fg" style="max-width:360px;margin-bottom:1.1rem;">
         <label for="examNombreInput">Nombre del examen (opcional)</label>
@@ -1110,6 +1110,7 @@ let examenPreparacion=[]; // [{ cursosArr, cursoLabel, temasActivos:[[key,cfgClo
 // ESTE tema tras añadirlo. Devuelve si realmente se añadió algo, para que
 // tanto el botón individual como la acción masiva puedan reaccionar.
 function procesarAgregarTema(key){
+  if(generandoExamen) return {ok:false, motivo:'generando'}; // no modificar el examen en preparación mientras se genera
   if(!selCursos.size) return {ok:false, motivo:'curso'};
   const cfg=temasCfg.get(key);
   if(!cfg) return {ok:false, motivo:'nocfg'};
@@ -1159,6 +1160,8 @@ function agregarTema(key){
   if(!r.ok){
     const msg = r.motivo==='curso'
       ? 'Selecciona al menos un curso.'
+      : r.motivo==='generando'
+      ? 'Espera a que termine de generarse el examen actual.'
       : 'Indica un nº de preguntas mayor que 0 en alguna dificultad.';
     document.getElementById('genMsg').innerHTML=`<span style="color:#e05555;font-size:.8rem;">${msg}</span>`;
     return;
@@ -1499,6 +1502,10 @@ function confirmarSimulacro(){
 }
 
 function renderPrep(){
+  // Mientras se está generando un examen, "Examen en preparación" debe
+  // permanecer exactamente como estaba: ningún redibujado (llegue desde
+  // donde llegue) puede tocar su contenido hasta que termine la generación.
+  if(generandoExamen) return;
   const card=document.getElementById('prepCard');
   const list=document.getElementById('prepList');
   if(!examenPreparacion.length){
@@ -1530,11 +1537,13 @@ function renderPrep(){
 }
 
 function eliminarSeleccionPrep(i){
+  if(generandoExamen) return; // el examen en preparación no se toca mientras se genera
   examenPreparacion.splice(i,1);
   renderPrep();
 }
 
 function vaciarExamenPrep(){
+  if(generandoExamen) return; // el examen en preparación no se toca mientras se genera
   if(!examenPreparacion.length) return;
   if(!confirm('¿Vaciar el examen en preparación? Se perderán todas las selecciones añadidas.')) return;
   examenPreparacion=[];
@@ -1597,18 +1606,35 @@ function procesarSeleccion(cursosArr, temasActivos){
   return sel;
 }
 
+// Único indicador de "hay una generación en curso": bloquea una segunda
+// generación (doble clic incluido) y cualquier modificación del examen en
+// preparación mientras tanto. El "Examen en preparación" NO se toca (ni se
+// vacía ni se oculta) hasta que el backend confirme éxito.
+let generandoExamen = false;
+
+// Alterna únicamente el aspecto/estado de los controles de "Examen en
+// preparación" durante la generación; nunca toca el contenido de
+// examenPreparacion.
+function actualizarEstadoGenerando(activo){
+  const btnGen=document.getElementById('btnGen');
+  if(btnGen){
+    btnGen.disabled = activo || !examenPreparacion.length;
+    btnGen.innerHTML = activo
+      ? '<span class="spin"></span>&nbsp;⏳ Generando examen…'
+      : '⚡ Generar Examen';
+  }
+  const btnVaciar=document.getElementById('btnVaciarPrep');
+  if(btnVaciar) btnVaciar.disabled = activo;
+  document.querySelectorAll('#prepList .prep-del').forEach(b=>{ b.disabled = activo; });
+}
+
 async function genExamFromPrep(){
+  if(generandoExamen) return; // doble clic / doble invocación: solo puede haber una generación a la vez
   if(!examenPreparacion.length){document.getElementById('genMsgFinal').innerHTML='<span style="color:#e05555;font-size:.8rem;">Añade al menos una selección al examen.</span>';return;}
   document.getElementById('genMsgFinal').innerHTML='';
 
-  // Consumir YA las selecciones en preparación (antes de cualquier operación
-  // asíncrona): así, si el usuario pulsa "+ Añadir" o "Generar" mientras esta
-  // generación todavía está en curso, esa acción no puede fusionarse con una
-  // entrada que ya se está procesando ni volver a incluirla en otra
-  // generación. Si la persistencia falla más abajo, se restaura.
-  const seleccionesAProcesar = examenPreparacion;
-  examenPreparacion = [];
-  renderPrep();
+  generandoExamen = true;
+  actualizarEstadoGenerando(true);
 
   let selTotal=[];
   const temasLabelsSet=new Set();
@@ -1620,7 +1646,9 @@ async function genExamFromPrep(){
   // haberlo hecho realmente, violando la prioridad por usos.
   const incrementosAplicados=[];
 
-  for(const seleccion of seleccionesAProcesar){
+  // "Examen en preparación" se lee, pero no se toca: sigue mostrándose tal
+  // cual durante toda la generación.
+  for(const seleccion of examenPreparacion){
     const {cursosArr, temasActivos, cursoLabel} = seleccion;
     temasActivos.forEach(([t])=>temasLabelsSet.add(t));
     cursosArr.forEach(k=>{ if(!cursoKeysVistos.includes(k)) cursoKeysVistos.push(k); });
@@ -1641,10 +1669,8 @@ async function genExamFromPrep(){
   }
 
   if(!selTotal.length){
-    // No se pudo generar nada: devolver la selección a "en preparación" en
-    // vez de perderla, para no obligar al usuario a reconfigurarla.
-    examenPreparacion = seleccionesAProcesar;
-    renderPrep();
+    generandoExamen = false;
+    actualizarEstadoGenerando(false);
     document.getElementById('genMsgFinal').innerHTML='<span style="color:#e05555;font-size:.8rem;">❌ No hay preguntas disponibles.</span>';
     return;
   }
@@ -1655,18 +1681,14 @@ async function genExamFromPrep(){
   const nombreInput=document.getElementById('examNombreInput');
   const nombreExamen=(nombreInput?.value||'').trim();
 
-  const btnGen=document.getElementById('btnGen');
-  if(btnGen) btnGen.disabled=true;
-  document.getElementById('genMsgFinal').innerHTML='<span style="color:var(--txt3);font-size:.8rem;"><span class="spin"></span>&nbsp;Generando examen…</span>';
-
   const rows = construirFilasExamen(selTotal, nombreExamen);
   const updates = construirUpdatesUsos(selTotal);
 
   // Persistencia en UNA única operación: el Apps Script asigna el
   // examen_id, actualiza usos y guarda EXAMENES de forma atómica (bajo
   // LockService). Hasta que esto no resuelve con {ok:true}, el examen NO se
-  // considera generado: no hay ID local, no se navega al Historial, y si
-  // falla se restaura íntegramente el estado previo.
+  // considera generado: no hay ID local, no se navega al Historial, y el
+  // examen en preparación permanece intacto para poder reintentar.
   let examenId;
   try{
     examenId = await persistirExamenEnSheets(rows, updates);
@@ -1675,10 +1697,9 @@ async function genExamFromPrep(){
       const r=db.find(r=>r._idx===_idx);
       if(r) cursosArr.forEach(k=>{ r[k]=Math.max(0,(r[k]||0)-1); });
     });
-    examenPreparacion = seleccionesAProcesar;
-    renderPrep();
-    if(btnGen) btnGen.disabled=false;
-    document.getElementById('genMsgFinal').innerHTML=`<span style="color:#e05555;font-size:.8rem;">❌ No se pudo generar el examen (${esc(err.message)}). La configuración se ha conservado: puedes pulsar "Generar" de nuevo para reintentarlo.</span>`;
+    generandoExamen = false;
+    actualizarEstadoGenerando(false);
+    document.getElementById('genMsgFinal').innerHTML=`<span style="color:#e05555;font-size:.8rem;">❌ No se pudo generar el examen (${esc(err.message)}). La configuración se ha conservado: puedes pulsar "Generar Examen" de nuevo para reintentarlo.</span>`;
     return;
   }
 
@@ -1692,6 +1713,7 @@ async function genExamFromPrep(){
   const difsUsadas=[...new Set(selTotal.map(q=>q.dificultad).filter(Boolean))];
   const difLabel=difsUsadas.length===1?difsUsadas[0]:(difsUsadas.length>1?'Mixta':'Todas');
 
+  // A. El examen se considera generado.
   currentExam={
     id:examenId,
     nombre:nombreExamen||null,
@@ -1703,14 +1725,20 @@ async function genExamFromPrep(){
     preguntas:selTotal
   };
 
-  mostrarToast(nombreExamen?`✅ Examen "${nombreExamen}" generado (${selTotal.length} preguntas)`:`✅ Examen #${examenId} generado (${selTotal.length} preguntas)`);
+  // B. Mensaje de éxito.
+  mostrarToast(nombreExamen?`✓ Examen #${examenId} · ${nombreExamen} generado correctamente`:`✓ Examen #${examenId} generado correctamente`);
 
-  document.getElementById('genMsgFinal').innerHTML='';
-
-  // El nombre introducido se limpia; examenPreparacion ya se vació al empezar
+  // C. Limpiar examen en preparación y nombre (solo ahora, ya con éxito confirmado).
+  examenPreparacion=[];
   if(nombreInput) nombreInput.value='';
+
+  // D. Fin del estado de carga.
+  generandoExamen = false;
+  actualizarEstadoGenerando(false);
+  document.getElementById('genMsgFinal').innerHTML='';
   renderPrep();
 
+  // E. Actualizar Historial (ya contiene el examen recién generado) y F. abrirlo.
   goTab('historial');
 }
 
