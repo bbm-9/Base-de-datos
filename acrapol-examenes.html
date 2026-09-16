@@ -2067,12 +2067,17 @@ function crearErrorAppsScript(mensaje, extra){
   return e;
 }
 
-async function llamarAppsScript(url, options){
+// `etiqueta` (p.ej. 'generarExamen' o 'getExamenes') se antepone a los
+// mensajes de error para que nunca haya duda de qué petición ha fallado:
+// una escritura (generarExamen) nunca debe confundirse con una lectura del
+// Historial (getExamenes).
+async function llamarAppsScript(url, options, etiqueta){
+  const prefijo = etiqueta ? `[${etiqueta}] ` : '';
   let response;
   try{
     response = await fetch(url, options);
   }catch(err){
-    throw crearErrorAppsScript('No se pudo contactar con el servidor: ' + err.message);
+    throw crearErrorAppsScript(prefijo + 'No se pudo contactar con el servidor: ' + err.message);
   }
 
   const raw = await response.text();
@@ -2081,7 +2086,7 @@ async function llamarAppsScript(url, options){
 
   if(pareceHtml){
     throw crearErrorAppsScript(
-      `Apps Script devolvió HTML en lugar de JSON. HTTP ${response.status} / URL final: ${response.url}${response.redirected ? ' (hubo redirección)' : ''}`,
+      `${prefijo}Apps Script devolvió HTML en lugar de JSON. HTTP ${response.status} / URL final: ${response.url}${response.redirected ? ' (hubo redirección)' : ''}`,
       { raw, status:response.status, url:response.url, redirected:response.redirected }
     );
   }
@@ -2091,7 +2096,7 @@ async function llamarAppsScript(url, options){
     data = JSON.parse(raw);
   }catch(err){
     throw crearErrorAppsScript(
-      `Respuesta del servidor no es JSON válido. HTTP ${response.status} / URL final: ${response.url}`,
+      `${prefijo}Respuesta del servidor no es JSON válido. HTTP ${response.status} / URL final: ${response.url}`,
       { raw, status:response.status, url:response.url, redirected:response.redirected }
     );
   }
@@ -2121,17 +2126,17 @@ function persistirExamenEnSheets(rows, updates){
     // que los Web Apps de Apps Script no responden.
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify({ action:'generarExamen', rows, updates })
-  }).then(({data})=>{
+  }, 'generarExamen').then(({data})=>{
     if(data.ok === true) return data.examen_id;
     if(data.ok === false){
-      const e = new Error(data.error || 'Error desconocido al generar el examen');
+      const e = new Error('[generarExamen] ' + (data.error || 'Error desconocido al generar el examen'));
       e.indeterminado = false;
       throw e;
     }
     // Respuesta bien formada como JSON pero que no cumple el contrato de
     // generarExamen (por ejemplo, ausencia total de "ok"): no es el fallo
     // confirmado que garantiza el backend, así que se trata como indeterminado.
-    throw crearErrorAppsScript('Respuesta inesperada del servidor: ' + JSON.stringify(data).slice(0, 200));
+    throw crearErrorAppsScript('[generarExamen] Respuesta inesperada del servidor: ' + JSON.stringify(data).slice(0, 200));
   });
 }
 
@@ -2186,12 +2191,24 @@ function toggleHistExam(hdrEl){
   if(chev) chev.textContent=cerrado?'▾':'▸';
 }
 
-function cargarHistorial(){
+// GET getExamenes es lectura, idempotente: un fallo transitorio (p.ej. Apps
+// Script devolviendo HTML/404 en la redirección a script.googleusercontent.com
+// justo después de una escritura grande) se reintenta como máximo una vez,
+// con una pequeña espera, reconstruyendo SIEMPRE la URL desde API_URL --
+// nunca desde response.url ni desde la URL de script.googleusercontent.com.
+// Esto es exclusivamente sobre la LECTURA del Historial: nunca reintenta ni
+// afecta al POST de generarExamen, que ya se considera confirmado (toast +
+// limpieza de la preparación) antes de que exista esta llamada.
+const HISTORIAL_MAX_INTENTOS = 2;
+function cargarHistorial(intento){
+  intento = intento || 1;
   const msg  = document.getElementById('historialMsg');
   const list = document.getElementById('historialList');
-  msg.innerHTML = `<div class="alert a-info"><span class="spin"></span>&nbsp;Cargando historial…</div>`;
-  list.innerHTML = '';
-  llamarAppsScript(`${API_URL}?action=getExamenes`)
+  if(intento===1){
+    msg.innerHTML = `<div class="alert a-info"><span class="spin"></span>&nbsp;Cargando historial…</div>`;
+    list.innerHTML = '';
+  }
+  llamarAppsScript(`${API_URL}?action=getExamenes`, undefined, 'getExamenes')
     .then(({data})=>{
       msg.innerHTML='';
       if(!data.ok){ msg.innerHTML=`<div class="alert a-err">❌ ${esc(data.error||'')}</div>`; return; }
@@ -2250,7 +2267,17 @@ function cargarHistorial(){
           </div>
         </div>`).join('');
     })
-    .catch(err=>{ msg.innerHTML=`<div class="alert a-err">❌ Error: ${esc(err.message)}</div>`; });
+    .catch(err=>{
+      if(intento < HISTORIAL_MAX_INTENTOS){
+        setTimeout(()=>cargarHistorial(intento+1), 600);
+        return;
+      }
+      // Fallo de LECTURA tras agotar los reintentos: si se acaba de generar
+      // un examen, ya está confirmado y guardado (el POST resolvió antes de
+      // llegar aquí) -- esto NUNCA se presenta como si la generación hubiese
+      // fallado, solo como que el Historial no se ha podido refrescar solo.
+      msg.innerHTML = `<div class="alert a-err">⚠️ No se pudo actualizar el Historial automáticamente. Si acabas de generar un examen, ya se ha guardado correctamente.<br><small style="color:var(--txt3);">${esc(err.message)}</small><br><button type="button" class="btn btn-ghost" style="margin-top:.5rem;font-size:.72rem;" onclick="cargarHistorial()">🔄 Reintentar Historial</button></div>`;
+    });
 }
 
 // ══ TOAST NOTIFICACIONES ══
