@@ -1597,15 +1597,25 @@ function procesarSeleccion(cursosArr, temasActivos){
   return sel;
 }
 
-function genExamFromPrep(){
+async function genExamFromPrep(){
   if(!examenPreparacion.length){document.getElementById('genMsgFinal').innerHTML='<span style="color:#e05555;font-size:.8rem;">Añade al menos una selección al examen.</span>';return;}
   document.getElementById('genMsgFinal').innerHTML='';
+
+  // Consumir YA las selecciones en preparación (antes de cualquier operación
+  // asíncrona): así, si el usuario pulsa "+ Añadir" o "Generar" mientras esta
+  // generación todavía está persistiendo sus usos, esa acción no puede
+  // fusionarse con una entrada que ya se está procesando ni volver a
+  // incluirla en otra generación (esa era la causa de que se actualizaran en
+  // Sheets más IDs de los que contenía el examen mostrado).
+  const seleccionesAProcesar = examenPreparacion;
+  examenPreparacion = [];
+  renderPrep();
 
   let selTotal=[];
   const temasLabelsSet=new Set();
   const cursoKeysVistos=[];
 
-  for(const seleccion of examenPreparacion){
+  for(const seleccion of seleccionesAProcesar){
     const {cursosArr, temasActivos, cursoLabel} = seleccion;
     temasActivos.forEach(([t])=>temasLabelsSet.add(t));
     cursosArr.forEach(k=>{ if(!cursoKeysVistos.includes(k)) cursoKeysVistos.push(k); });
@@ -1622,7 +1632,14 @@ function genExamFromPrep(){
     selTotal=selTotal.concat(sel.map(q=>({...q, _cursoLabel:cursoLabel})));
   }
 
-  if(!selTotal.length){document.getElementById('genMsgFinal').innerHTML='<span style="color:#e05555;font-size:.8rem;">❌ No hay preguntas disponibles.</span>';return;}
+  if(!selTotal.length){
+    // No se pudo generar nada: devolver la selección a "en preparación" en
+    // vez de perderla, para no obligar al usuario a reconfigurarla.
+    examenPreparacion = seleccionesAProcesar;
+    renderPrep();
+    document.getElementById('genMsgFinal').innerHTML='<span style="color:#e05555;font-size:.8rem;">❌ No hay preguntas disponibles.</span>';
+    return;
+  }
 
   // Ordenar por ID
   selTotal.sort((a,b)=>String(a.id).localeCompare(String(b.id),undefined,{numeric:true}));
@@ -1631,48 +1648,52 @@ function genExamFromPrep(){
   const nombreExamen=(nombreInput?.value||'').trim();
 
   renderStats(); renderTable();
-  actualizarUsosenSheets(selTotal);
 
   const btnGen=document.getElementById('btnGen');
   if(btnGen) btnGen.disabled=true;
   document.getElementById('genMsgFinal').innerHTML='<span style="color:var(--txt3);font-size:.8rem;"><span class="spin"></span>&nbsp;Generando examen…</span>';
 
+  // Persistir los usos ANTES de dar la generación por terminada: hasta que
+  // esto no resuelve (éxito o error, ya gestionado dentro de la propia
+  // función con su toast), no se libera el botón "Generar" ni se vuelve a
+  // dejar disponible el examen en preparación, para que no puedan solaparse
+  // dos generaciones escribiendo usos a la vez.
+  await actualizarUsosenSheets(selTotal);
+
   // El nº de examen se calcula a partir de los exámenes ya guardados en Google
   // Sheets (no solo desde memoria del navegador), para que sea incremental y
   // persistente aunque se recargue la página o haya varias sesiones abiertas.
-  obtenerSiguienteExamenId().then(nuevoId=>{
-    examCount=nuevoId;
-    guardarExamenEnSheets(selTotal, nombreExamen);
+  const nuevoId = await obtenerSiguienteExamenId();
+  examCount=nuevoId;
+  guardarExamenEnSheets(selTotal, nombreExamen);
 
-    const cursoLabel=cursoKeysVistos.map(k=>CURSO_LABEL[k]||k).join(' + ');
-    const tLabel=[...temasLabelsSet].join(', ');
+  const cursoLabel=cursoKeysVistos.map(k=>CURSO_LABEL[k]||k).join(' + ');
+  const tLabel=[...temasLabelsSet].join(', ');
 
-    // Calcular dificultades usadas en el examen
-    const difsUsadas=[...new Set(selTotal.map(q=>q.dificultad).filter(Boolean))];
-    const difLabel=difsUsadas.length===1?difsUsadas[0]:(difsUsadas.length>1?'Mixta':'Todas');
+  // Calcular dificultades usadas en el examen
+  const difsUsadas=[...new Set(selTotal.map(q=>q.dificultad).filter(Boolean))];
+  const difLabel=difsUsadas.length===1?difsUsadas[0]:(difsUsadas.length>1?'Mixta':'Todas');
 
-    currentExam={
-      id:examCount,
-      nombre:nombreExamen||null,
-      cursoLabel,
-      num:selTotal.length,
-      dif:difLabel,
-      temas:tLabel,
-      fecha:new Date().toLocaleDateString('es-ES'),
-      preguntas:selTotal
-    };
+  currentExam={
+    id:examCount,
+    nombre:nombreExamen||null,
+    cursoLabel,
+    num:selTotal.length,
+    dif:difLabel,
+    temas:tLabel,
+    fecha:new Date().toLocaleDateString('es-ES'),
+    preguntas:selTotal
+  };
 
-    mostrarToast(nombreExamen?`✅ Examen "${nombreExamen}" generado (${selTotal.length} preguntas)`:`✅ Examen #${examCount} generado (${selTotal.length} preguntas)`);
+  mostrarToast(nombreExamen?`✅ Examen "${nombreExamen}" generado (${selTotal.length} preguntas)`:`✅ Examen #${examCount} generado (${selTotal.length} preguntas)`);
 
-    document.getElementById('genMsgFinal').innerHTML='';
+  document.getElementById('genMsgFinal').innerHTML='';
 
-    // El examen ya generado vacía el examen en preparación y el nombre introducido
-    examenPreparacion=[];
-    if(nombreInput) nombreInput.value='';
-    renderPrep();
+  // El nombre introducido se limpia; examenPreparacion ya se vació al empezar
+  if(nombreInput) nombreInput.value='';
+  renderPrep();
 
-    goTab('historial');
-  });
+  goTab('historial');
 }
 
 // Siguiente examen_id: el mayor visto en Google Sheets (o en el contador local
@@ -1883,7 +1904,11 @@ function actualizarUsosenSheets(preguntas, cursosArr){
         });
     });
   });
-  cadena
+  // Se devuelve la cadena para que genExamFromPrep() pueda esperar (await) a
+  // que TODOS los lotes hayan terminado antes de considerar la generación
+  // completa: si no se esperase, una acción posterior (otra generación, un
+  // "+ Añadir") podría solaparse con estos envíos todavía en curso.
+  return cadena
     .then(()=>{
       if(huboError) mostrarToast('⚠ Error Sheets al actualizar usos', true);
       else mostrarToast(`✅ ${totalActualizadas} preguntas actualizadas en Google Sheets`);
