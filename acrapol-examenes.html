@@ -550,7 +550,7 @@ const SUBBLOQUES_OFICIALES = ['Escala Básica','Escala Ejecutiva','Inspector e I
 const numTema = s => { const m=String(s||'').match(/(\d+)/); return m?parseInt(m[1]):999; };
 
 // ══ STATE ══
-let db=[], filtered=[], examCount=0, currentExam=null;
+let db=[], filtered=[], currentExam=null;
 let colMap={}, sortK='_idx', sortAsc=true, page=1;
 const PER=25;
 // selCursos, selBloques, selTemas, temasCfg declarados en el bloque de Crear Examen
@@ -1603,10 +1603,9 @@ async function genExamFromPrep(){
 
   // Consumir YA las selecciones en preparación (antes de cualquier operación
   // asíncrona): así, si el usuario pulsa "+ Añadir" o "Generar" mientras esta
-  // generación todavía está persistiendo sus usos, esa acción no puede
-  // fusionarse con una entrada que ya se está procesando ni volver a
-  // incluirla en otra generación (esa era la causa de que se actualizaran en
-  // Sheets más IDs de los que contenía el examen mostrado).
+  // generación todavía está en curso, esa acción no puede fusionarse con una
+  // entrada que ya se está procesando ni volver a incluirla en otra
+  // generación. Si la persistencia falla más abajo, se restaura.
   const seleccionesAProcesar = examenPreparacion;
   examenPreparacion = [];
   renderPrep();
@@ -1614,6 +1613,12 @@ async function genExamFromPrep(){
   let selTotal=[];
   const temasLabelsSet=new Set();
   const cursoKeysVistos=[];
+  // Se registra cada incremento local aplicado (pregunta + cursos afectados)
+  // para poder deshacerlo exactamente si la persistencia en Sheets falla:
+  // como en ese caso no ha quedado nada guardado, dejar el incremento en
+  // memoria haría que un reintento tratase esas preguntas como usadas sin
+  // haberlo hecho realmente, violando la prioridad por usos.
+  const incrementosAplicados=[];
 
   for(const seleccion of seleccionesAProcesar){
     const {cursosArr, temasActivos, cursoLabel} = seleccion;
@@ -1625,7 +1630,10 @@ async function genExamFromPrep(){
     // Incrementar contadores SOLO en los cursos propios de esta selección
     sel.forEach(q=>{
       const r=db.find(r=>r._idx===q._idx);
-      if(r) cursosArr.forEach(k=>{ r[k]=(r[k]||0)+1; });
+      if(r){
+        cursosArr.forEach(k=>{ r[k]=(r[k]||0)+1; });
+        incrementosAplicados.push({_idx:q._idx, cursosArr});
+      }
     });
 
     // Copia con el curso de esta selección, para registrar el examen sin mezclar cursos entre selecciones
@@ -1647,32 +1655,35 @@ async function genExamFromPrep(){
   const nombreInput=document.getElementById('examNombreInput');
   const nombreExamen=(nombreInput?.value||'').trim();
 
-  renderStats(); renderTable();
-
   const btnGen=document.getElementById('btnGen');
   if(btnGen) btnGen.disabled=true;
   document.getElementById('genMsgFinal').innerHTML='<span style="color:var(--txt3);font-size:.8rem;"><span class="spin"></span>&nbsp;Generando examen…</span>';
 
-  // Persistir los usos ANTES de dar la generación por terminada: hasta que
-  // esto no resuelve (éxito o error, ya gestionado dentro de la propia
-  // función con su toast), no se libera el botón "Generar" ni se vuelve a
-  // dejar disponible el examen en preparación, para que no puedan solaparse
-  // dos generaciones escribiendo usos a la vez.
-  await actualizarUsosenSheets(selTotal);
+  const rows = construirFilasExamen(selTotal, nombreExamen);
+  const updates = construirUpdatesUsos(selTotal);
 
-  // El nº de examen se calcula a partir de los exámenes ya guardados en Google
-  // Sheets (no solo desde memoria del navegador), para que sea incremental y
-  // persistente aunque se recargue la página o haya varias sesiones abiertas.
-  const nuevoId = await obtenerSiguienteExamenId();
-  examCount=nuevoId;
-  // Esperar a que TODOS los lotes del examen se hayan guardado en EXAMENES
-  // antes de refrescar el Historial (goTab('historial') más abajo): si no se
-  // esperase, esa llamada a getExamenes() puede llegar mientras el guardado
-  // (secuencial, en varios lotes para exámenes grandes) todavía está en
-  // curso, y el Historial mostraría solo las preguntas de los lotes que ya
-  // hubiesen terminado en ese instante, aunque en Sheets acaben estando
-  // todas correctamente.
-  await guardarExamenEnSheets(selTotal, nombreExamen);
+  // Persistencia en UNA única operación: el Apps Script asigna el
+  // examen_id, actualiza usos y guarda EXAMENES de forma atómica (bajo
+  // LockService). Hasta que esto no resuelve con {ok:true}, el examen NO se
+  // considera generado: no hay ID local, no se navega al Historial, y si
+  // falla se restaura íntegramente el estado previo.
+  let examenId;
+  try{
+    examenId = await persistirExamenEnSheets(rows, updates);
+  }catch(err){
+    incrementosAplicados.forEach(({_idx, cursosArr})=>{
+      const r=db.find(r=>r._idx===_idx);
+      if(r) cursosArr.forEach(k=>{ r[k]=Math.max(0,(r[k]||0)-1); });
+    });
+    examenPreparacion = seleccionesAProcesar;
+    renderPrep();
+    if(btnGen) btnGen.disabled=false;
+    document.getElementById('genMsgFinal').innerHTML=`<span style="color:#e05555;font-size:.8rem;">❌ No se pudo generar el examen (${esc(err.message)}). La configuración se ha conservado: puedes pulsar "Generar" de nuevo para reintentarlo.</span>`;
+    return;
+  }
+
+  // A partir de aquí el examen SÍ está persistido: se refleja en la UI.
+  renderStats(); renderTable();
 
   const cursoLabel=cursoKeysVistos.map(k=>CURSO_LABEL[k]||k).join(' + ');
   const tLabel=[...temasLabelsSet].join(', ');
@@ -1682,7 +1693,7 @@ async function genExamFromPrep(){
   const difLabel=difsUsadas.length===1?difsUsadas[0]:(difsUsadas.length>1?'Mixta':'Todas');
 
   currentExam={
-    id:examCount,
+    id:examenId,
     nombre:nombreExamen||null,
     cursoLabel,
     num:selTotal.length,
@@ -1692,7 +1703,7 @@ async function genExamFromPrep(){
     preguntas:selTotal
   };
 
-  mostrarToast(nombreExamen?`✅ Examen "${nombreExamen}" generado (${selTotal.length} preguntas)`:`✅ Examen #${examCount} generado (${selTotal.length} preguntas)`);
+  mostrarToast(nombreExamen?`✅ Examen "${nombreExamen}" generado (${selTotal.length} preguntas)`:`✅ Examen #${examenId} generado (${selTotal.length} preguntas)`);
 
   document.getElementById('genMsgFinal').innerHTML='';
 
@@ -1701,28 +1712,6 @@ async function genExamFromPrep(){
   renderPrep();
 
   goTab('historial');
-}
-
-// Siguiente examen_id: el mayor visto en Google Sheets (o en el contador local
-// de esta sesión, por si acabamos de guardar uno que aún no se refleje) + 1.
-// Nunca reutiliza IDs antiguos.
-function obtenerSiguienteExamenId(){
-  return fetch(`https://script.google.com/macros/s/AKfycbz8A8boQzNJDScZEb0-LN-5FofUZ4Zkb6ObjroLlz7-GoCE3HLEHFsRzkZWNVJAJOzo/exec?action=getExamenes`)
-    .then(r=>r.json())
-    .then(data=>{
-      let maxId=0;
-      if(data.ok && Array.isArray(data.rows)){
-        data.rows.forEach(r=>{
-          const n=parseInt(r.examen_id,10);
-          if(!isNaN(n) && n>maxId) maxId=n;
-        });
-      }
-      return Math.max(maxId, examCount)+1;
-    })
-    .catch(()=>{
-      // Sin conexión: no bloqueamos la generación, seguimos con el contador local
-      return examCount+1;
-    });
 }
 
 
@@ -1870,61 +1859,25 @@ function procesarFilasSheets(rows){
   document.getElementById('noBD').style.display='none';
 }
 
-function actualizarUsosenSheets(preguntas, cursosArr){
-  const updates = preguntas.map(q=>{
+// Construye, a partir de las preguntas ya seleccionadas (con sus usos ya
+// incrementados en local), el array de usos a persistir. Pura: no hace red.
+// Misma forma exacta que antes enviaba actualizarUsosenSheets.
+function construirUpdatesUsos(preguntas){
+  return preguntas.map(q=>{
     const r = db.find(r=>r._idx===q._idx);
     if(!r) return null;
     return { id:r.id, usos_mod1:r.usos_mod1, usos_mod2:r.usos_mod2, usos_mod3:r.usos_mod3, usos_int:r.usos_int };
   }).filter(Boolean);
-  if(!updates.length) return;
-
-  // Igual que al guardar el examen (enviarFilasExamenEnLotes): una tanda grande
-  // (p. ej. un simulacro de 100 preguntas) puede generar una URL de decenas de
-  // miles de caracteres si se manda de una vez, y muchos servidores/proxies la
-  // rechazan en silencio. Sin este batching, esos usos NUNCA llegan a
-  // persistirse en Sheets aunque sí queden incrementados en memoria local: la
-  // siguiente vez que se cargue la base de datos, esas preguntas vuelven a
-  // aparecer con usos anteriores a los reales y compiten de nuevo por
-  // prioridad. Se agrupan en lotes que quepan con margen en una URL y se
-  // envían uno tras otro (nunca en paralelo) contra la MISMA acción
-  // "updateUsos" del Apps Script, sin tocarlo.
-  const LIMITE_URL=6000;
-  const lotes=[];
-  let actual=[], tam=2; // "[]"
-  updates.forEach(u=>{
-    const tamItem=encodeURIComponent(JSON.stringify(u)).length+3;
-    if(actual.length && tam+tamItem>LIMITE_URL){ lotes.push(actual); actual=[]; tam=2; }
-    actual.push(u); tam+=tamItem;
-  });
-  if(actual.length) lotes.push(actual);
-
-  let totalActualizadas=0, huboError=false;
-  let cadena=Promise.resolve();
-  lotes.forEach(lote=>{
-    cadena=cadena.then(()=>{
-      const encoded=encodeURIComponent(JSON.stringify(lote));
-      return fetch(`https://script.google.com/macros/s/AKfycbz8A8boQzNJDScZEb0-LN-5FofUZ4Zkb6ObjroLlz7-GoCE3HLEHFsRzkZWNVJAJOzo/exec?action=updateUsos&updates=${encoded}`)
-        .then(r=>r.json())
-        .then(data=>{
-          if(data.ok) totalActualizadas+=data.updated||lote.length;
-          else huboError=true;
-        });
-    });
-  });
-  // Se devuelve la cadena para que genExamFromPrep() pueda esperar (await) a
-  // que TODOS los lotes hayan terminado antes de considerar la generación
-  // completa: si no se esperase, una acción posterior (otra generación, un
-  // "+ Añadir") podría solaparse con estos envíos todavía en curso.
-  return cadena
-    .then(()=>{
-      if(huboError) mostrarToast('⚠ Error Sheets al actualizar usos', true);
-      else mostrarToast(`✅ ${totalActualizadas} preguntas actualizadas en Google Sheets`);
-    })
-    .catch(()=>mostrarToast('⚠ Sin conexión, cambios solo en local', true));
 }
 
 // ══ HISTORIAL DE EXÁMENES ══
-function guardarExamenEnSheets(preguntas, nombreExamen){
+
+// Construye las filas jerárquicas de EXAMENES exactamente igual que antes
+// (cascada bloque > subbloque > tema > subtema; dificultad siempre la real
+// de cada fila, nunca heredada). Pura: no hace red. La celda de examen_id
+// (columna B) se deja vacía a propósito: el Apps Script la rellena con el
+// siguiente ID dentro de la misma operación de guardado (generarExamen).
+function construirFilasExamen(preguntas, nombreExamen){
   const fecha = new Date().toLocaleDateString('es-ES');
 
   // Curso agregado de todo el examen (únicos, en orden de aparición): solo
@@ -1936,12 +1889,6 @@ function guardarExamenEnSheets(preguntas, nombreExamen){
   });
   const cursoLabel=cursos.join(' + ');
 
-  // Una fila por pregunta, en el mismo orden en que se generó el examen.
-  // bloque/subbloque/tema/subtema se muestran en cascada: cada nivel solo se
-  // repite cuando cambia él mismo o alguno de los niveles superiores
-  // (bloque > subbloque > tema > subtema). La dificultad, en cambio, va
-  // siempre completa: es la dificultad real de esa pregunta, nunca un
-  // agregado tipo "Mixta".
   const rows=[];
   let lastBloque='', lastSub='', lastTema='', lastSubtema='';
 
@@ -1960,7 +1907,7 @@ function guardarExamenEnSheets(preguntas, nombreExamen){
 
     rows.push([
       i===0 ? fecha             : '',
-      i===0 ? examCount         : '',
+      '', // examen_id: lo asigna el Apps Script (generarExamen), no el navegador
       i===0 ? (nombreExamen||'') : '',
       i===0 ? cursoLabel        : '',
       bloqueCambio  ? bloqueReal  : '',
@@ -1974,46 +1921,27 @@ function guardarExamenEnSheets(preguntas, nombreExamen){
     ]);
   });
 
-  return enviarFilasExamenEnLotes(rows);
+  return rows;
 }
 
-// Un examen grande (p. ej. un simulacro de 100 preguntas con texto real)
-// puede generar una URL de decenas de miles de caracteres si se manda de
-// una vez: muchos servidores/proxies la rechazan en silencio (a diferencia
-// de actualizarUsosenSheets, cuyo payload por pregunta es mucho más
-// pequeño). Por eso una tanda grande "generaba bien y actualizaba usos"
-// pero no llegaba a guardarse en EXAMENES. La solución es de transporte,
-// no de lógica: se agrupan las mismas filas ya construidas en lotes que
-// quepan con margen en una URL, y se envían uno tras otro (nunca en
-// paralelo, para no alterar el orden ni la fila donde empieza cada lote)
-// contra la MISMA acción "saveExamen" del Apps Script, sin tocarlo.
-function enviarFilasExamenEnLotes(rows){
-  const LIMITE_URL=6000; // longitud (ya codificada) máxima por lote, con margen amplio
-  const lotes=[];
-  let actual=[];
-  let tam=2; // "[]"
-  rows.forEach(row=>{
-    // Medido ya codificado: el texto en español (tildes, ¿, ñ...) se expande
-    // notablemente con encodeURIComponent, mucho más que su longitud "en crudo".
-    const tamFila=encodeURIComponent(JSON.stringify(row)).length+3;
-    if(actual.length && tam+tamFila>LIMITE_URL){ lotes.push(actual); actual=[]; tam=2; }
-    actual.push(row);
-    tam+=tamFila;
-  });
-  if(actual.length) lotes.push(actual);
-
-  // Se devuelve la cadena para que genExamFromPrep() pueda esperar (await) a
-  // que TODOS los lotes hayan terminado antes de refrescar el Historial.
-  let cadena=Promise.resolve();
-  lotes.forEach(loteRows=>{ cadena=cadena.then(()=>enviarLoteExamen(loteRows)); });
-  return cadena.catch(err=>console.warn('Error guardando examen:', err));
-}
-
-function enviarLoteExamen(rows){
-  const encoded=encodeURIComponent(JSON.stringify({ rows }));
-  return fetch(`https://script.google.com/macros/s/AKfycbz8A8boQzNJDScZEb0-LN-5FofUZ4Zkb6ObjroLlz7-GoCE3HLEHFsRzkZWNVJAJOzo/exec?action=saveExamen&exam=${encoded}`)
-    .then(r=>r.json())
-    .then(d=>{ if(!d.ok) console.warn('Error guardando examen:', d.error); });
+// Persiste el examen completo en UNA única petición POST: el Apps Script
+// calcula el examen_id (max existente + 1, bajo LockService), actualiza los
+// usos de BD en bloque y guarda las filas de EXAMENES, todo en la misma
+// operación atómica. Devuelve el examen_id asignado; rechaza si algo falla
+// (sin ID local de emergencia: si esto falla, no hay examen que mostrar).
+function persistirExamenEnSheets(rows, updates){
+  return fetch(API_URL, {
+    method: 'POST',
+    // text/plain evita que el navegador dispare un preflight CORS OPTIONS,
+    // que los Web Apps de Apps Script no responden.
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action:'generarExamen', rows, updates })
+  })
+    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(data=>{
+      if(!data.ok) throw new Error(data.error || 'Error desconocido al generar el examen');
+      return data.examen_id;
+    });
 }
 
 // Reconstruye los exámenes a partir de las filas planas de la hoja EXAMENES:
