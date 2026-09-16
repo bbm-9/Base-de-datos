@@ -228,6 +228,12 @@ tbody tr:last-child td{border-bottom:none;}
 .blq-sep-row{grid-column:1/-1;font-family:'Bebas Neue',sans-serif;letter-spacing:2px;font-size:.75rem;padding:.6rem .85rem .3rem;color:var(--txt3);border-bottom:1px solid var(--borde);}
 .tema-add-btn{padding:.4rem .5rem;border-radius:3px;border:1px solid var(--dorado);background:var(--dorado-dim);color:var(--dorado);font-size:.68rem;font-weight:600;letter-spacing:.5px;white-space:nowrap;cursor:pointer;transition:all .15s;}
 .tema-add-btn:hover{background:var(--dorado);color:var(--negro);}
+.subtema-toggle{display:block;margin-top:.15rem;font-size:.66rem;color:var(--txt3);cursor:pointer;background:none;border:none;padding:0;text-align:left;letter-spacing:.3px;}
+.subtema-toggle:hover{color:var(--dorado);}
+.tema-subtema-panel{padding:.5rem .85rem .7rem 2.75rem;border-bottom:1px solid var(--borde);background:rgba(255,255,255,.012);display:flex;flex-wrap:wrap;align-items:center;gap:.15rem 1rem;}
+.tema-subtema-panel .tsp-label{font-size:.66rem;color:var(--txt3);letter-spacing:.5px;flex-basis:100%;margin-bottom:.15rem;}
+.tsp-check{display:flex;align-items:center;gap:.35rem;font-size:.76rem;color:var(--txt2);cursor:pointer;white-space:nowrap;}
+.tsp-check input{accent-color:var(--dorado);cursor:pointer;}
 
 /* EXAMEN EN PREPARACIÓN — lista compacta */
 .prep-row{display:flex;align-items:center;gap:.5rem;padding:.5rem .85rem;border-bottom:1px solid var(--borde);font-size:.82rem;flex-wrap:wrap;}
@@ -238,6 +244,7 @@ tbody tr:last-child td{border-bottom:none;}
 .prep-dif{color:var(--dorado);font-family:'IBM Plex Mono',monospace;font-size:.76rem;}
 .prep-n{color:var(--txt2);font-family:'IBM Plex Mono',monospace;font-size:.76rem;flex-shrink:0;white-space:nowrap;margin-left:auto;}
 .prep-sep{color:var(--txt3);flex-shrink:0;}
+.prep-contenido{color:var(--txt3);font-size:.74rem;flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px;}
 .prep-del{background:none;border:none;color:var(--txt3);font-size:.9rem;cursor:pointer;padding:.15rem .4rem;flex-shrink:0;border-radius:3px;transition:all .15s;}
 .prep-del:hover{color:#e05555;background:rgba(205,22,25,.12);}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--s4);border-top-color:var(--dorado);border-radius:50%;animation:rot .7s linear infinite;vertical-align:middle;}
@@ -972,15 +979,17 @@ function buildTemasCfg(){
           promos.forEach(pr=>{
             const key='OFI::'+bo+'::'+pr;
             const prev=temasCfg.get(key)||{activo:false,nBaja:0,nMedia:0,nAlta:0,nTodas:0};
-            nuevosCfg.set(key,{...prev,_bo:bo,_promo:pr,_bloque:bk,_label:pr});
-            list.appendChild(buildTemaRow(pr, bv, prev, key));
+            const subtemasSel=prev.subtemasSel instanceof Set ? prev.subtemasSel : new Set(['']);
+            nuevosCfg.set(key,{...prev,_bo:bo,_promo:pr,_bloque:bk,_label:pr,subtemasSel});
+            list.appendChild(buildTemaRow(pr, bv, nuevosCfg.get(key), key));
           });
         } else {
           // Sin promociones → una sola fila para el bloque oficial
           const key='OFI::'+bo;
           const prev=temasCfg.get(key)||{activo:false,nBaja:0,nMedia:0,nAlta:0,nTodas:0};
-          nuevosCfg.set(key,{...prev,_bo:bo,_bloque:bk,_label:bo});
-          list.appendChild(buildTemaRow(bo, bv, prev, key));
+          const subtemasSel=prev.subtemasSel instanceof Set ? prev.subtemasSel : new Set(['']);
+          nuevosCfg.set(key,{...prev,_bo:bo,_bloque:bk,_label:bo,subtemasSel});
+          list.appendChild(buildTemaRow(bo, bv, nuevosCfg.get(key), key));
         }
       });
     } else {
@@ -989,8 +998,17 @@ function buildTemasCfg(){
       if(!temas.length) continue;
       temas.forEach(t=>{
         const prev=temasCfg.get(t)||{activo:false,nBaja:0,nMedia:0,nAlta:0,nTodas:0};
-        nuevosCfg.set(t,{...prev,_tema:t,_bloque:bk,_label:t});
-        list.appendChild(buildTemaRow(t, bv, prev, t));
+        const subtemasSel=prev.subtemasSel instanceof Set ? prev.subtemasSel : new Set(['']);
+        nuevosCfg.set(t,{...prev,_tema:t,_bloque:bk,_label:t,subtemasSel});
+        const cfgActual=nuevosCfg.get(t);
+        // Solo se muestra el control de subtemas para temas que realmente
+        // tienen alguna pregunta con subtema no vacío: no añade ruido visual
+        // al resto.
+        const subtemasDisponibles=[...new Set(db.filter(r=>r.tema_nombre===t && r.subtema).map(r=>r.subtema))].sort();
+        list.appendChild(buildTemaRow(t, bv, cfgActual, t, subtemasDisponibles.length>0));
+        if(subtemasDisponibles.length){
+          list.appendChild(buildSubtemaPanel(t, cfgActual, subtemasDisponibles));
+        }
       });
     }
   }
@@ -1000,7 +1018,7 @@ function buildTemasCfg(){
   updTotal();
 }
 
-function buildTemaRow(t, bv, cfg, key){
+function buildTemaRow(t, bv, cfg, key, tieneSubtemas){
   key = key || t;
   // Contar disponibles
   const isOfi = key && key.startsWith('OFI::');
@@ -1030,7 +1048,9 @@ function buildTemaRow(t, bv, cfg, key){
     <div class="tcb ${cfg.activo?'on':''}" onclick="toggleTemaActivo('${kEsc}',this)">
       <svg viewBox="0 0 12 12"><polyline points="2,6 5,9 10,3"/></svg>
     </div>
-    <div class="tnombre" title="${esc(t)}" style="color:${bv?bv.color:'var(--txt2)'}">${esc(t)}</div>
+    <div class="tnombre" title="${esc(t)}" style="color:${bv?bv.color:'var(--txt2)'}">${esc(t)}${tieneSubtemas
+      ? `<button type="button" class="subtema-toggle" onclick="toggleSubtemaPanel('${kEsc}',this)">▶ Subtemas</button>`
+      : ''}</div>
     <div class="tdisponibles">${dispStr}</div>
     <div class="tdifn"><input type="number" class="tdifn-input" data-campo="nBaja" value="${cfg.nBaja||0}" min="0" max="999"
       oninput="updTemaDif('${kEsc}','nBaja',+this.value);updTotal()"></div>
@@ -1042,6 +1062,41 @@ function buildTemaRow(t, bv, cfg, key){
       oninput="updTemaDif('${kEsc}','nTodas',+this.value);updTotal()"></div>
     <button type="button" class="tema-add-btn" title="Añadir este tema al examen" onclick="agregarTema('${kEsc}')">+ Añadir</button>`;
   return row;
+}
+
+// Panel plegable "Contenido incluido" para temas con subtemas: por defecto
+// solo "General" (preguntas con subtema vacío) va marcado, tal y como pide
+// la regla de exclusión por defecto de los subtemas.
+function buildSubtemaPanel(t, cfg, subtemasDisponibles){
+  const key=cfg._tema||t;
+  const kEsc=key.replace(/'/g,"\\'");
+  const panel=document.createElement('div');
+  panel.className='tema-subtema-panel';
+  panel.dataset.temaPanel=key;
+  panel.hidden=true;
+  const checks=[['', 'General'], ...subtemasDisponibles.map(st=>[st, st])];
+  panel.innerHTML=`<div class="tsp-label">Contenido incluido:</div>` + checks.map(([val,label])=>{
+    const valEsc=String(val).replace(/'/g,"\\'");
+    const checked=cfg.subtemasSel && cfg.subtemasSel.has(val) ? 'checked' : '';
+    return `<label class="tsp-check"><input type="checkbox" ${checked} onchange="toggleSubtemaSel('${kEsc}','${valEsc}',this.checked)"> ${esc(label)}</label>`;
+  }).join('');
+  return panel;
+}
+
+function toggleSubtemaPanel(key, btnEl){
+  const panel=document.querySelector(`.tema-subtema-panel[data-tema-panel="${CSS.escape(key)}"]`);
+  if(!panel) return;
+  const vaAAbrir=panel.hidden;
+  panel.hidden=!vaAAbrir;
+  btnEl.textContent = vaAAbrir ? '▼ Subtemas' : '▶ Subtemas';
+}
+
+function toggleSubtemaSel(key, valor, marcado){
+  const cfg=temasCfg.get(key);
+  if(!cfg) return;
+  if(!(cfg.subtemasSel instanceof Set)) cfg.subtemasSel=new Set(['']);
+  if(marcado) cfg.subtemasSel.add(valor);
+  else cfg.subtemasSel.delete(valor);
 }
 
 function toggleTemaActivo(t, checkEl){
@@ -1114,6 +1169,9 @@ function procesarAgregarTema(key){
   if(!selCursos.size) return {ok:false, motivo:'curso'};
   const cfg=temasCfg.get(key);
   if(!cfg) return {ok:false, motivo:'nocfg'};
+  // Ningún contenido (ni "General" ni ningún subtema) marcado: no hay de
+  // dónde seleccionar preguntas.
+  if(cfg.subtemasSel instanceof Set && cfg.subtemasSel.size===0) return {ok:false, motivo:'sincontenido'};
 
   // Una sub-configuración por cada dificultad con nº de preguntas > 0
   // ('' = Todas, sin filtrar por dificultad)
@@ -1138,7 +1196,10 @@ function procesarAgregarTema(key){
   }
 
   nuevas.forEach(({dif,nPregs})=>{
-    const cfgNueva={...cfg, dif, nPregs};
+    // subtemasSel se clona (no se copia la referencia): así, si el usuario
+    // vuelve a tocar los checkboxes de este tema DESPUÉS de añadirlo, no
+    // altera retroactivamente una selección ya guardada en examenPreparacion.
+    const cfgNueva={...cfg, dif, nPregs, subtemasSel: new Set(cfg.subtemasSel instanceof Set ? cfg.subtemasSel : [''])};
     delete cfgNueva.activo; delete cfgNueva.nBaja; delete cfgNueva.nMedia; delete cfgNueva.nAlta; delete cfgNueva.nTodas;
     const idx=entrada.temasActivos.findIndex(([k,c])=>k===key && c.dif===dif);
     if(idx>=0) entrada.temasActivos[idx]=[key,cfgNueva];
@@ -1162,6 +1223,8 @@ function agregarTema(key){
       ? 'Selecciona al menos un curso.'
       : r.motivo==='generando'
       ? 'Espera a que termine de generarse el examen actual.'
+      : r.motivo==='sincontenido'
+      ? 'Marca al menos "General" o un subtema en "Contenido incluido".'
       : 'Indica un nº de preguntas mayor que 0 en alguna dificultad.';
     document.getElementById('genMsg').innerHTML=`<span style="color:#e05555;font-size:.8rem;">${msg}</span>`;
     return;
@@ -1479,6 +1542,10 @@ function confirmarSimulacro(){
     if(!cfg) return;
     const m=matriz.get(key)||{Baja:0,Media:0,Alta:0};
     cfg.nBaja=m.Baja||0; cfg.nMedia=m.Media||0; cfg.nAlta=m.Alta||0; cfg.nTodas=0;
+    // Los Simulacros, de momento, usan siempre contenido "General": los
+    // subtemas quedan excluidos aunque el tema los tenga y aunque en Paso 3
+    // se hubiese configurado otra cosa para ese mismo tema anteriormente.
+    cfg.subtemasSel=new Set(['']);
     const r=procesarAgregarTema(key);
     if(r.ok) añadidos++;
   });
@@ -1520,6 +1587,10 @@ function renderPrep(){
     const [,cfg0]=s.temasActivos[0]||[null,{}];
     const label=cfg0._label||cfg0._tema||'';
     const difsTxt=s.temasActivos.map(([,c])=>`${c.dif||'Todas'} ${c.nPregs}`).join(' | ');
+    // Si hay algo más que "General" marcado, se indica de forma compacta;
+    // si es solo General, no se añade ruido visual a la línea.
+    const soloGeneral = !(cfg0.subtemasSel instanceof Set) || (cfg0.subtemasSel.size===1 && cfg0.subtemasSel.has(''));
+    const contenidoTxt = soloGeneral ? '' : [...cfg0.subtemasSel].map(v=>v===''?'General':v).join(' + ');
     return `<div class="prep-row">
       <span class="prep-curso">${esc(s.cursoLabel)}</span>
       <span class="prep-sep">·</span>
@@ -1528,6 +1599,7 @@ function renderPrep(){
       <span class="prep-dif">${esc(difsTxt)}</span>
       <span class="prep-sep">·</span>
       <span class="prep-n">Total ${s.numPreguntas}</span>
+      ${contenidoTxt ? `<span class="prep-sep">·</span><span class="prep-contenido" title="${esc(contenidoTxt)}">${esc(contenidoTxt)}</span>` : ''}
       <button class="prep-del" onclick="eliminarSeleccionPrep(${i})" title="Eliminar">✕</button>
     </div>`;
   }).join('');
@@ -1556,6 +1628,12 @@ function procesarSeleccion(cursosArr, temasActivos){
 
   // Por cada tema activo, seleccionar sus preguntas
   for(const [t, cfg] of temasActivos){
+    // Los subtemas quedan excluidos por defecto: una pregunta solo entra en
+    // el pool si su subtema (o la ausencia de él, "General") está marcado en
+    // cfg.subtemasSel. Si no hay selección explícita (temas sin control de
+    // subtemas), se admite cualquier subtema tal y como se hacía antes.
+    const contenidoOk = r => !(cfg.subtemasSel instanceof Set) || cfg.subtemasSel.has(r.subtema||'');
+
     // Si la clave empieza por OFI:: es bloque oficial
     let pool;
     if(t.startsWith('OFI::')){
@@ -1564,13 +1642,13 @@ function procesarSeleccion(cursosArr, temasActivos){
       const promo=parts[1]||null;
       if(promo){
         // Con promoción: filtrar por subbloque=bo y promo=promo
-        pool=db.filter(r=>r.subbloque===bo && r.promo===promo && (!cfg.dif || r.dificultad===cfg.dif));
+        pool=db.filter(r=>r.subbloque===bo && r.promo===promo && (!cfg.dif || r.dificultad===cfg.dif) && contenidoOk(r));
       } else {
         // Sin promoción: todas las preguntas del bloque oficial
-        pool=db.filter(r=>r.subbloque===bo && (!cfg.dif || r.dificultad===cfg.dif));
+        pool=db.filter(r=>r.subbloque===bo && (!cfg.dif || r.dificultad===cfg.dif) && contenidoOk(r));
       }
     } else {
-      pool=db.filter(r=>r.tema_nombre===t && r.bloque===(cfg._bloque||r.bloque) && (!cfg.dif || r.dificultad===cfg.dif));
+      pool=db.filter(r=>r.tema_nombre===t && r.bloque===(cfg._bloque||r.bloque) && (!cfg.dif || r.dificultad===cfg.dif) && contenidoOk(r));
     }
     if(!pool.length) continue;
     const n=cfg.nPregs||10;
