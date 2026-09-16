@@ -1665,7 +1665,14 @@ async function genExamFromPrep(){
   // persistente aunque se recargue la página o haya varias sesiones abiertas.
   const nuevoId = await obtenerSiguienteExamenId();
   examCount=nuevoId;
-  guardarExamenEnSheets(selTotal, nombreExamen);
+  // Esperar a que TODOS los lotes del examen se hayan guardado en EXAMENES
+  // antes de refrescar el Historial (goTab('historial') más abajo): si no se
+  // esperase, esa llamada a getExamenes() puede llegar mientras el guardado
+  // (secuencial, en varios lotes para exámenes grandes) todavía está en
+  // curso, y el Historial mostraría solo las preguntas de los lotes que ya
+  // hubiesen terminado en ese instante, aunque en Sheets acaben estando
+  // todas correctamente.
+  await guardarExamenEnSheets(selTotal, nombreExamen);
 
   const cursoLabel=cursoKeysVistos.map(k=>CURSO_LABEL[k]||k).join(' + ');
   const tLabel=[...temasLabelsSet].join(', ');
@@ -1967,7 +1974,7 @@ function guardarExamenEnSheets(preguntas, nombreExamen){
     ]);
   });
 
-  enviarFilasExamenEnLotes(rows);
+  return enviarFilasExamenEnLotes(rows);
 }
 
 // Un examen grande (p. ej. un simulacro de 100 preguntas con texto real)
@@ -1995,9 +2002,11 @@ function enviarFilasExamenEnLotes(rows){
   });
   if(actual.length) lotes.push(actual);
 
+  // Se devuelve la cadena para que genExamFromPrep() pueda esperar (await) a
+  // que TODOS los lotes hayan terminado antes de refrescar el Historial.
   let cadena=Promise.resolve();
   lotes.forEach(loteRows=>{ cadena=cadena.then(()=>enviarLoteExamen(loteRows)); });
-  cadena.catch(err=>console.warn('Error guardando examen:', err));
+  return cadena.catch(err=>console.warn('Error guardando examen:', err));
 }
 
 function enviarLoteExamen(rows){
