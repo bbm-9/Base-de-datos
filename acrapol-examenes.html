@@ -1771,29 +1771,40 @@ async function genExamFromPrep(){
   try{
     examenId = await persistirExamenEnSheets(rows, updates);
   }catch(err){
-    generandoExamen = false;
-    actualizarEstadoGenerando(false);
-
     if(err.indeterminado){
-      // No sabemos si el backend llegó a escribir (p.ej. respondió HTML, o
-      // una forma de JSON que no es el {ok:false,...} que garantiza
-      // generarExamen): NUNCA se asume fallo, NUNCA se reintenta solo, y NO
-      // se deshacen los incrementos locales -- podrían ya estar reflejados
-      // en Sheets, y revertirlos violaría la prioridad por usos en el
-      // próximo examen si el guardado sí tuvo éxito.
-      document.getElementById('genMsgFinal').innerHTML=`<span style="color:#c8952b;font-size:.8rem;">⚠️ No se pudo confirmar la respuesta del servidor. El examen puede haberse generado. Actualiza el Historial antes de volver a intentarlo.<br><small style="color:var(--txt3);">${esc(err.message)}</small></span>`;
+      // No sabemos, por la respuesta del POST, si el backend llegó a
+      // escribir (p.ej. Apps Script sirvió HTML/404 en el salto de
+      // redirección script.google.com -> script.googleusercontent.com,
+      // algo ajeno a doPost/generarExamen). Antes de decidir nada, se
+      // verifica con una lectura getExamenes (transporte de solo lectura,
+      // ya con su propio reintento) si el examen recién construido
+      // (mismo nombre, mismo total de preguntas, mismo primer/último ID)
+      // ya está en EXAMENES. Esto SOLO puede confirmar un éxito que ya
+      // había ocurrido en el servidor; si no se encuentra, o si esta
+      // verificación también falla, se mantiene como no confirmado --
+      // nunca se reinterpreta como fallo ni habilita un reintento del POST.
+      const examenIdVerificado = await verificarExamenPersistido(selTotal, nombreExamen);
+      if(examenIdVerificado){
+        examenId = examenIdVerificado;
+      } else {
+        generandoExamen = false;
+        actualizarEstadoGenerando(false);
+        document.getElementById('genMsgFinal').innerHTML=`<span style="color:#c8952b;font-size:.8rem;">⚠️ No se pudo confirmar la respuesta del servidor. El examen puede haberse generado. Actualiza el Historial antes de volver a intentarlo.<br><small style="color:var(--txt3);">${esc(err.message)}</small></span>`;
+        return;
+      }
+    } else {
+      // Fallo CONFIRMADO por el propio backend (ok:false explícito): el
+      // contrato de generarExamen garantiza que en ese caso no se ha escrito
+      // nada, así que es seguro deshacer los incrementos locales y reintentar.
+      incrementosAplicados.forEach(({_idx, cursosArr})=>{
+        const r=db.find(r=>r._idx===_idx);
+        if(r) cursosArr.forEach(k=>{ r[k]=Math.max(0,(r[k]||0)-1); });
+      });
+      generandoExamen = false;
+      actualizarEstadoGenerando(false);
+      document.getElementById('genMsgFinal').innerHTML=`<span style="color:#e05555;font-size:.8rem;">❌ No se pudo generar el examen (${esc(err.message)}). La configuración se ha conservado: puedes pulsar "Generar Examen" de nuevo para reintentarlo.</span>`;
       return;
     }
-
-    // Fallo CONFIRMADO por el propio backend (ok:false explícito): el
-    // contrato de generarExamen garantiza que en ese caso no se ha escrito
-    // nada, así que es seguro deshacer los incrementos locales y reintentar.
-    incrementosAplicados.forEach(({_idx, cursosArr})=>{
-      const r=db.find(r=>r._idx===_idx);
-      if(r) cursosArr.forEach(k=>{ r[k]=Math.max(0,(r[k]||0)-1); });
-    });
-    document.getElementById('genMsgFinal').innerHTML=`<span style="color:#e05555;font-size:.8rem;">❌ No se pudo generar el examen (${esc(err.message)}). La configuración se ha conservado: puedes pulsar "Generar Examen" de nuevo para reintentarlo.</span>`;
-    return;
   }
 
   // A partir de aquí el examen SÍ está persistido: se refleja en la UI.
@@ -2140,6 +2151,53 @@ function persistirExamenEnSheets(rows, updates){
   });
 }
 
+// Cuando la respuesta del POST generarExamen no pudo leerse (estado
+// indeterminado: HTML/404 típico del salto de redirección
+// script.google.com -> script.googleusercontent.com/macros/echo bajo
+// ejecuciones largas, ajeno a doPost/generarExamen), esto verifica por una
+// vía de solo lectura -- ya demostrada fiable, con su propio reintento
+// corto -- si el examen realmente llegó a guardarse: busca, entre los
+// exámenes de EXAMENES, uno con el mismo nombre, el mismo total de
+// preguntas y el mismo primer y último ID de pregunta que el que se acaba
+// de intentar generar. Devuelve el examen_id real si lo encuentra, o
+// `null` si no lo encuentra o si esta propia verificación también falla.
+// IMPORTANTE: `null` nunca se interpreta como fallo confirmado -- solo
+// puede CONFIRMAR un éxito que ya había ocurrido en el servidor, nunca
+// convertir un estado indeterminado en un fallo.
+async function verificarExamenPersistido(selTotal, nombreExamen, intentos){
+  intentos = intentos || 2;
+  const nombreEsperado = (nombreExamen||'').trim();
+  const idsEsperados = selTotal.map(q=>q.id);
+  if(!idsEsperados.length) return null;
+
+  let data;
+  for(let i=0;i<intentos;i++){
+    try{
+      ({data} = await llamarAppsScript(`${API_URL}?action=getExamenes`, undefined, 'getExamenes(verificación)'));
+      break;
+    }catch(e){
+      if(i===intentos-1) return null;
+      await new Promise(res=>setTimeout(res, 600));
+    }
+  }
+  if(!data || !data.ok || !Array.isArray(data.rows)) return null;
+
+  const candidatos = agruparExamenesHistorial(data.rows).filter(ex=>{
+    if((ex.nombre||'').trim()!==nombreEsperado) return false;
+    if(Number(ex.total_preguntas)!==idsEsperados.length) return false;
+    const idsReales = ex.preguntas.map(p=>p.id);
+    return idsReales.length===idsEsperados.length &&
+      idsReales[0]===idsEsperados[0] &&
+      idsReales[idsReales.length-1]===idsEsperados[idsEsperados.length-1];
+  });
+  if(!candidatos.length) return null;
+
+  // Si hubiese más de una coincidencia (no debería, dado lo específico del
+  // criterio), se toma el examen_id mayor: el más reciente.
+  candidatos.sort((a,b)=>(parseInt(b.examen_id,10)||0)-(parseInt(a.examen_id,10)||0));
+  return parseInt(candidatos[0].examen_id, 10) || null;
+}
+
 // Reconstruye los exámenes a partir de las filas planas de la hoja EXAMENES:
 // cada fila con examen_id abre un examen nuevo; las filas siguientes (sin
 // examen_id) pertenecen a ese mismo examen hasta la próxima con examen_id.
@@ -2175,7 +2233,11 @@ function agruparExamenesHistorial(rows){
     actual.preguntas.push({
       bloque, subbloque, tema, subtema,
       dificultad: r.dificultad || '',
-      id: r.ids_preguntas || '',
+      // Corregido: getExamenes() (Apps Script) devuelve el campo como
+      // "id_preguntas" (sin "s"); leerlo como "ids_preguntas" hacía que la
+      // columna ID del Historial estuviera siempre vacía, con independencia
+      // de este cambio.
+      id: r.id_preguntas || '',
       pregunta: r.preguntas || ''
     });
   });
